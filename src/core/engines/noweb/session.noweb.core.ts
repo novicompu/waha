@@ -23,6 +23,7 @@ import makeWASocket, {
   WAMessageContent,
   WAMessageKey,
   WAMessageUpdate,
+  WAVersion,
 } from '@adiwajshing/baileys';
 import { WACallEvent } from '@adiwajshing/baileys/lib/Types/Call';
 import { BaileysEventMap } from '@adiwajshing/baileys/lib/Types/Events';
@@ -43,6 +44,7 @@ import type {
 import { ILogger } from '@adiwajshing/baileys/lib/Utils/logger';
 import { isLidUser } from '@adiwajshing/baileys/lib/WABinary/jid-utils';
 import { UnprocessableEntityException } from '@nestjs/common';
+import { parseMessageCapping } from '@waha/core/abc/capping';
 import {
   getChannelInviteLink,
   getPublicUrlFromDirectPath,
@@ -73,7 +75,12 @@ import { AckToStatus, StatusToAck } from '@waha/core/utils/acks';
 import { pairs } from '@waha/utils/pairs';
 import { ExtractMessageKeysForRead } from '@waha/core/utils/convertors';
 import { parseMessageIdSerialized } from '@waha/core/utils/ids';
-import { isJidNewsletter, toCusFormat, toJID } from '@waha/core/utils/jids';
+import {
+  isJidNewsletter,
+  jidsFromKey,
+  toCusFormat,
+  toJID,
+} from '@waha/core/utils/jids';
 import { DistinctAck, DistinctMessages } from '@waha/core/utils/reactive';
 import {
   flipObject,
@@ -149,6 +156,7 @@ import {
   CreateGroupRequest,
   GroupParticipant,
   ParticipantsRequest,
+  SettingsMemberAddMode,
   SettingsSecurityChangeInfo,
 } from '@waha/structures/groups.dto';
 import {
@@ -166,7 +174,13 @@ import {
   WAHAPresenceData,
 } from '@waha/structures/presence.dto';
 import { WAMessage, WAMessageReaction } from '@waha/structures/responses.dto';
-import { MeInfo } from '@waha/structures/sessions.dto';
+import {
+  MeInfo,
+  MessageCappingData,
+  ReachoutTimelockData,
+  ReachoutTimelockEnforcementType,
+} from '@waha/structures/sessions.dto';
+import { EnsureSeconds } from '@waha/utils/timehelper';
 import {
   BROADCAST_ID,
   DeleteStatusRequest,
@@ -185,7 +199,7 @@ import {
   WAMessageRevokedBody,
 } from '@waha/structures/webhooks.dto';
 import { LoggerBuilder } from '@waha/utils/logging';
-import { sleep, waitUntil } from '@waha/utils/promiseTimeout';
+import { promiseTimeout, sleep, waitUntil } from '@waha/utils/promiseTimeout';
 import { exclude } from '@waha/utils/reactive/ops/exclude';
 import { SingleDelayedJobRunner } from '@waha/utils/SingleDelayedJobRunner';
 import { SinglePeriodicJobRunner } from '@waha/utils/SinglePeriodicJobRunner';
@@ -235,6 +249,7 @@ import { detectMimetype } from '@waha/utils/files';
 import esm from '@waha/vendor/esm';
 import axios from 'axios';
 import axiosRetry from 'axios-retry';
+import { formatWaVersion } from '@waha/core/engines/noweb/waversion';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const promiseRetry = require('promise-retry');
 
@@ -259,11 +274,18 @@ const PresenceStatuses = {
 };
 const ToEnginePresenceStatus = flipObject(PresenceStatuses);
 
+export interface NowebConfig {
+  waVersion: WAVersion;
+}
+
 export class WhatsappSessionNoWebCore extends WhatsappSession {
   private START_ATTEMPT_DELAY_SECONDS = 2;
   private AUTO_RESTART_AFTER_SECONDS = 28 * 60;
+  // how long to wait on stop for the WebSocket close handshake and store close before forcing it
+  private CLOSE_TIMEOUT_MS = 3_000;
 
   engine = WAHAEngine.NOWEB;
+  protected engineConfig: NowebConfig;
   authFactory = new NowebAuthFactoryCore();
   storageFactory = new NowebStorageFactoryCore();
   private startDelayedJob: SingleDelayedJobRunner;
@@ -381,7 +403,9 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     if (markOnlineOnConnect == undefined) {
       markOnlineOnConnect = true;
     }
+    const version = this.engineConfig?.waVersion;
     return {
+      version: version,
       agent: agents?.socket,
       // Baileys media upload uses Node https.request in Node runtime.
       fetchAgent: agents?.fetch as Agent,
@@ -419,6 +443,9 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
       agents,
       state,
     ) as SocketConfig;
+    this.logger.info(
+      `Connecting using wa.version = ${formatWaVersion(socketConfig.version)}`,
+    );
     const sock = makeWASocket(socketConfig);
     sock.ev.on('creds.update', saveCreds);
     return sock;
@@ -540,13 +567,33 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
 
   protected listenConnectionEvents() {
     this.logger.debug(`Start listening ${BaileysEvents.CONNECTION_UPDATE}...`);
+    this.sock.ev.on('message-capping.update', (data) => {
+      this.messageCapping.update(parseMessageCapping(data));
+    });
     this.sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr, isNewLogin } = update;
+      if (update.reachoutTimeLock) {
+        this.updateReachoutTimelockFromState(update.reachoutTimeLock);
+      }
       if (isNewLogin) {
         this.restartClient();
       } else if (connection === 'open') {
         this.qr.save('');
         this.status = WAHASessionStatus.WORKING;
+        // Ask WhatsApp for the current reachout timelock state, so a restarted session learns about
+        // an ongoing timelock without waiting for a push. The result arrives via 'connection.update'
+        this.sock?.fetchAccountReachoutTimelock?.().catch((error) => {
+          this.logger.warn(`Failed to fetch reachout timelock: ${error}`);
+        });
+        // Same for the new-chat message capping - there is no push on (re)connect, only on changes
+        this.sock
+          ?.fetchNewChatMessageCap?.()
+          .then((data) => {
+            this.messageCapping.update(parseMessageCapping(data));
+          })
+          .catch((error) => {
+            this.logger.warn(`Failed to fetch message capping: ${error}`);
+          });
         // Do we need to resubscribe?
         // Ideally not, we need to explicitly call interesting
         // jids every 1 minute
@@ -624,16 +671,11 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
       });
       this.logger.info('Creds saved');
     }
+    await this.end();
+    await this.closeStores();
     this.status = WAHASessionStatus.STOPPED;
     this.stopEvents();
-
     this.mediaManager.close();
-    await this.end();
-    await this.store?.close();
-    this.authNOWEBStore?.close().catch((err) => {
-      this.logger.error('Failed to close NOWEB auth store');
-      this.logger.error(err, err.stack);
-    });
   }
 
   protected async failed() {
@@ -649,8 +691,34 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
       await sleep(1_000);
     }
 
+    this.stopEvents();
+    this.mediaManager.close();
     await this.end();
-    await this.store?.close();
+    await this.closeStores();
+  }
+
+  /**
+   * Close the data and auth stores with a time bound - close() may flush pending writes,
+   * and broken storage must not block session stop or process shutdown
+   */
+  private async closeStores() {
+    if (this.store) {
+      await promiseTimeout(this.CLOSE_TIMEOUT_MS, this.store.close()).catch(
+        (err) => {
+          this.logger.error('Failed to close NOWEB store');
+          this.logger.error(err, err.stack);
+        },
+      );
+    }
+    if (this.authNOWEBStore) {
+      await promiseTimeout(
+        this.CLOSE_TIMEOUT_MS,
+        this.authNOWEBStore.close(),
+      ).catch((err) => {
+        this.logger.error('Failed to close NOWEB auth store');
+        this.logger.error(err, err.stack);
+      });
+    }
   }
 
   private fixMessages() {
@@ -830,13 +898,41 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     this.cleanupPresenceTimeout();
     this.presence = null;
     this.autoRestartJob.stop();
+    const sock = this.sock;
     // @ts-ignore
-    this.sock?.ev?.removeAllListeners();
-    this.sock?.ws?.removeAllListeners();
+    sock?.ev?.removeAllListeners();
+    sock?.ws?.removeAllListeners();
     // wait until connection is not connecting to avoid error:
     // "WebSocket was closed before the connection was established"
-    await waitUntil(async () => !this.sock?.ws?.isConnecting, 1_000, 10_000);
-    this.sock?.end(undefined);
+    await waitUntil(async () => !sock?.ws?.isConnecting, 1_000, 10_000);
+    if (!sock) {
+      return;
+    }
+    // sock.end() waits for the WebSocket close handshake - on a dead or already closed connection
+    // it can hang forever, so bound it and destroy the raw TCP socket to let the process exit
+    const closing = sock.end(undefined);
+    try {
+      await promiseTimeout(this.CLOSE_TIMEOUT_MS, closing);
+    } catch (err) {
+      this.logger.warn(
+        `WebSocket did not close in ${this.CLOSE_TIMEOUT_MS}ms, terminating it: ${err}`,
+      );
+      this.terminate(sock);
+    }
+  }
+
+  /**
+   * Destroy the raw TCP socket behind Baileys WebSocket wrapper.
+   * ws.terminate() skips the close handshake, so it works even on half-open connections.
+   */
+  private terminate(sock: ReturnType<typeof makeWASocket>) {
+    // 'socket' is protected on Baileys WebSocketClient, reach it at runtime
+    const raw = (sock.ws as any)?.socket;
+    try {
+      raw?.terminate?.();
+    } catch (err) {
+      this.logger.warn(`Failed to terminate WebSocket: ${err}`);
+    }
   }
 
   getSessionMeInfo(): MeInfo | null {
@@ -849,6 +945,8 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
       id: toCusFormat(meId),
       pushName: me.name,
       lid: jidNormalizedUser(me.lid),
+      reachoutTimelock: this.reachoutTimelock.value,
+      messageCapping: this.messageCapping.value,
     };
   }
 
@@ -937,6 +1035,39 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     const me = this.getSessionMeInfo();
     await this.sock.removeProfilePicture(me.id);
     return true;
+  }
+
+  @Activity()
+  public async fetchMessageCapping(): Promise<MessageCappingData> {
+    const data = await this.sock.fetchNewChatMessageCap();
+    const capping = parseMessageCapping(data);
+    // Keep the tracker in sync so MeInfo and 'session.status' reflect the fetch
+    this.messageCapping.update(capping);
+    return capping;
+  }
+
+  @Activity()
+  public async fetchReachoutTimelock(): Promise<ReachoutTimelockData> {
+    const state = await this.sock.fetchAccountReachoutTimelock();
+    return this.updateReachoutTimelockFromState(state);
+  }
+
+  private updateReachoutTimelockFromState(timelock: any): ReachoutTimelockData {
+    const enforcementType =
+      timelock.enforcementType ?? ReachoutTimelockEnforcementType.DEFAULT;
+    let timeEnforcementEnds: number | null = null;
+    if (timelock.timeEnforcementEnds) {
+      timeEnforcementEnds = EnsureSeconds(
+        timelock.timeEnforcementEnds.getTime(),
+      );
+    }
+    const data: ReachoutTimelockData = {
+      enforcementType: enforcementType as ReachoutTimelockEnforcementType,
+      isActive: timelock.isActive === true,
+      timeEnforcementEnds: timeEnforcementEnds,
+    };
+    this.reachoutTimelock.update(data);
+    return data;
   }
 
   /**
@@ -1205,12 +1336,20 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
         urlInfo.jpegThumbnail = thumbnail.buffer;
       } else {
         // upload HQ thumbnail
+        // newsletters need the thumbnail uploaded unencrypted (plaintext path),
+        // otherwise clients can not render it (white/blurred preview image)
+        const uploadToServer = this.sock.waUploadToServer;
+        const uploadThumbnail = async (encFilePath, opts) => {
+          opts.newsletter = isJidNewsletter(chatId);
+          return await uploadToServer(encFilePath, opts);
+        };
         const { imageMessage } = await esm.b.prepareWAMessageMedia(
           { image: content },
           {
-            upload: this.sock.waUploadToServer,
+            upload: uploadThumbnail,
             mediaTypeOverride: 'thumbnail-link',
             options: { signal: AbortSignal.timeout(10_000) },
+            jid: chatId,
           },
         );
         urlInfo.jpegThumbnail = imageMessage?.jpegThumbnail
@@ -1934,6 +2073,17 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
   public async setMessagesAdminsOnly(id, value) {
     const setting = value ? 'announcement' : 'not_announcement';
     return await this.sock.groupSettingUpdate(id, setting);
+  }
+
+  public async getMemberAddMode(id): Promise<SettingsMemberAddMode> {
+    const group = await this.getGroup(id);
+    return { membersCanAddNewMember: group.memberAddMode };
+  }
+
+  @Activity()
+  public async setMemberAddMode(id, value) {
+    const mode = value ? 'all_member_add' : 'admin_add';
+    return await this.sock.groupMemberAddMode(id, mode);
   }
 
   @Activity()
@@ -2882,9 +3032,12 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     if (!origMsgId) {
       return '';
     }
-    const jidsToTry = [targetKey.remoteJid, editMessage.key?.remoteJid].filter(
-      Boolean,
-    );
+    const editKey = editMessage.key as WAMessageKey | undefined;
+    const jidsToTry = [
+      targetKey.remoteJid,
+      editKey?.remoteJid,
+      editKey?.remoteJidAlt,
+    ].filter(Boolean);
     let stored: proto.IWebMessageInfo | undefined;
     for (const jid of jidsToTry) {
       stored = await this.store?.loadMessage(jid, origMsgId);
@@ -2915,40 +3068,75 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     if (!encPayload || !encIv) {
       return '';
     }
-    const editInfo = {
-      Chat: editMessage.key?.remoteJid,
-      Sender:
-        editMessage.key?.participant ||
-        (editMessage.key?.fromMe ? undefined : editMessage.key?.remoteJid),
-    };
-    const modificationSenderJid = jidToNonAD(editInfo.Sender || '');
-    const primaryOrig = getOrigSenderJidForMsgSecret(editInfo, {
-      fromMe: targetKey.fromMe,
-      remoteJID: targetKey.remoteJid,
-      participant: targetKey.participant,
-    });
-    const candidates: string[] = [primaryOrig];
+
+    // The editor ("modification sender").
+    let modificationSenderJids: Array<string | null | undefined>;
+    if (editKey?.fromMe) {
+      // Try both user lid and c.us
+      modificationSenderJids = [this.sock?.user?.lid, this.sock?.user?.id];
+    } else {
+      const editJids = editKey ? jidsFromKey(editKey) : null;
+      modificationSenderJids = [
+        editKey?.participant || editKey?.remoteJid,
+        editJids?.lid,
+        editJids?.pn,
+      ];
+    }
+    modificationSenderJids = lodash
+      .chain(modificationSenderJids)
+      .filter(Boolean)
+      .map(jidToNonAD)
+      .uniq()
+      .value();
+    if (modificationSenderJids.length === 0) {
+      modificationSenderJids.push('');
+    }
+
     const remoteNonAD = targetKey.remoteJid
       ? jidToNonAD(targetKey.remoteJid)
       : '';
-    if (remoteNonAD && !candidates.includes(remoteNonAD)) {
-      candidates.push(remoteNonAD);
-    }
     const participantNonAD = targetKey.participant
       ? jidToNonAD(targetKey.participant)
       : '';
-    if (participantNonAD && !candidates.includes(participantNonAD)) {
-      candidates.push(participantNonAD);
+
+    // Map dedupes by key and keeps the first-insertion order
+    const attempts = new Map<
+      string,
+      { origSenderJid: string; modificationSenderJid: string }
+    >();
+    for (const modificationSenderJid of modificationSenderJids) {
+      const primaryOrigSenderJid = getOrigSenderJidForMsgSecret(
+        { Chat: editKey?.remoteJid, Sender: modificationSenderJid },
+        {
+          fromMe: targetKey.fromMe,
+          remoteJID: targetKey.remoteJid,
+          participant: targetKey.participant,
+        },
+      );
+      const origSenderJids = [
+        primaryOrigSenderJid,
+        remoteNonAD,
+        participantNonAD,
+      ].filter(Boolean);
+      for (const origSenderJid of origSenderJids) {
+        // Avoid duplicates in attemps
+        const attemptKey = `${origSenderJid}|${modificationSenderJid}`;
+        attempts.set(attemptKey, {
+          origSenderJid: origSenderJid,
+          modificationSenderJid: modificationSenderJid,
+        });
+      }
     }
+
     let lastErr: unknown;
-    for (const origSenderJid of candidates) {
+    for (const attempt of attempts.values()) {
       try {
         const decoded = decryptSecretEncryptedMessageEditProto({
           encPayload: encPayload,
           encIv: encIv,
           origMsgId: origMsgId,
-          origSenderJid: origSenderJid,
-          modificationSenderJid: modificationSenderJid,
+          origSenderJid: attempt.origSenderJid,
+          modificationSenderJid: attempt.modificationSenderJid,
           origMsgSecret: origSecret,
         });
         const text = extractBody(decoded) || '';
@@ -2960,7 +3148,11 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
       }
     }
     this.logger.debug(
-      { err: lastErr, origMsgId: origMsgId, candidates: candidates },
+      {
+        err: lastErr,
+        origMsgId: origMsgId,
+        attempts: Array.from(attempts.keys()),
+      },
       'NOWEB message edit decrypt: AES-GCM or protobuf decode failed',
     );
     return '';

@@ -1050,6 +1050,18 @@ setGroupAnnounce: {
     responseDeserialize: deserialize_messages_Empty,
   },
   // send messages only by admins
+setGroupMemberAddMode: {
+    path: '/messages.MessageService/SetGroupMemberAddMode',
+    requestStream: false,
+    responseStream: false,
+    requestType: gows_pb.JidBoolRequest,
+    responseType: gows_pb.Empty,
+    requestSerialize: serialize_messages_JidBoolRequest,
+    requestDeserialize: deserialize_messages_JidBoolRequest,
+    responseSerialize: serialize_messages_Empty,
+    responseDeserialize: deserialize_messages_Empty,
+  },
+  // who can add members - true - all members, false - admins only
 updateGroupParticipants: {
     path: '/messages.MessageService/UpdateGroupParticipants',
     requestStream: false,
@@ -1129,6 +1141,33 @@ getProfilePicture: {
     requestDeserialize: deserialize_messages_ChatUnreadRequest,
     responseSerialize: serialize_messages_Empty,
     responseDeserialize: deserialize_messages_Empty,
+  },
+  //
+// Account
+//
+// Fetch the account's current reachout timelock state.
+fetchReachoutTimelock: {
+    path: '/messages.MessageService/FetchReachoutTimelock',
+    requestStream: false,
+    responseStream: false,
+    requestType: gows_pb.Session,
+    responseType: gows_pb.Json,
+    requestSerialize: serialize_messages_Session,
+    requestDeserialize: deserialize_messages_Session,
+    responseSerialize: serialize_messages_Json,
+    responseDeserialize: deserialize_messages_Json,
+  },
+  // Fetch the account's current new-chat message capping (per-cycle quota).
+fetchMessageCapping: {
+    path: '/messages.MessageService/FetchMessageCapping',
+    requestStream: false,
+    responseStream: false,
+    requestType: gows_pb.Session,
+    responseType: gows_pb.Json,
+    requestSerialize: serialize_messages_Session,
+    requestDeserialize: deserialize_messages_Session,
+    responseSerialize: serialize_messages_Json,
+    responseDeserialize: deserialize_messages_Json,
   },
   //
 // Message
