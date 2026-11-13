@@ -18,6 +18,10 @@ COPY package.json .
 COPY yarn.lock .
 COPY .yarnrc.yml .
 ENV YARN_CHECKSUM_BEHAVIOR=update
+# Avoid network timeouts (Yarn "onCancel handler" error) on slow/unstable connections
+ENV YARN_HTTP_TIMEOUT=300000
+ENV YARN_HTTP_RETRY=5
+ENV YARN_NETWORK_CONCURRENCY=8
 
 RUN npm install -g corepack && corepack enable
 RUN yarn install
